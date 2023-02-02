@@ -1,130 +1,113 @@
 import torch
-from torch import nn
-import torch.nn.functional as F
+import torch.nn as nn
+import numpy as np
 
-from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
-from utils.encoders import LanguageEmbeddingLayer, CPC, MMILB, RNNEncoder, SubNet
+# attention layer code inspired from: https://discuss.pytorch.org/t/self-attention-on-words-and-masking/5671/4
+class Attention(nn.Module):
+    def __init__(self, hidden_size, batch_first=False):
+        super(Attention, self).__init__()
 
-from transformers import BertModel, BertConfig
+        self.hidden_size = hidden_size
+        self.batch_first = batch_first
 
-class MMIM(nn.Module):
-    def __init__(self, hp):
-        """Construct MultiMoldal InfoMax model.
-        Args: 
-            hp (dict): a dict stores training and model configurations
-        """
-        # Base Encoders
-        super().__init__()
-        self.hp = hp
-        self.add_va = hp.add_va
-        hp.d_tout = hp.d_tin
+        self.att_weights = nn.Parameter(torch.Tensor(1, hidden_size), requires_grad=True)
 
-        self.text_enc = LanguageEmbeddingLayer(hp)
-        self.visual_enc = RNNEncoder(
-            in_size = hp.d_vin,
-            hidden_size = hp.d_vh,
-            out_size = hp.d_vout,
-            num_layers = hp.n_layer,
-            dropout = hp.dropout_v if hp.n_layer > 1 else 0.0,
-            bidirectional = hp.bidirectional
-        )
-        self.acoustic_enc = RNNEncoder(
-            in_size = hp.d_ain,
-            hidden_size = hp.d_ah,
-            out_size = hp.d_aout,
-            num_layers = hp.n_layer,
-            dropout = hp.dropout_a if hp.n_layer > 1 else 0.0,
-            bidirectional = hp.bidirectional
-        )
+        stdv = 1.0 / np.sqrt(self.hidden_size)
+        for weight in self.att_weights:
+            nn.init.uniform_(weight, -stdv, stdv)
 
-        # For MI maximization
-        self.mi_tv = MMILB(
-            x_size = hp.d_tout,
-            y_size = hp.d_vout,
-            mid_activation = hp.mmilb_mid_activation,
-            last_activation = hp.mmilb_last_activation
-        )
+    def get_mask(self):
+        pass
 
-        self.mi_ta = MMILB(
-            x_size = hp.d_tout,
-            y_size = hp.d_aout,
-            mid_activation = hp.mmilb_mid_activation,
-            last_activation = hp.mmilb_last_activation
-        )
-
-        if hp.add_va:
-            self.mi_va = MMILB(
-                x_size = hp.d_vout,
-                y_size = hp.d_aout,
-                mid_activation = hp.mmilb_mid_activation,
-                last_activation = hp.mmilb_last_activation
-            )
-
-        dim_sum = hp.d_aout + hp.d_vout + hp.d_tout
-
-        # CPC MI bound
-        self.cpc_zt = CPC(
-            x_size = hp.d_tout, # to be predicted
-            y_size = hp.d_prjh,
-            n_layers = hp.cpc_layers,
-            activation = hp.cpc_activation
-        )
-        self.cpc_zv = CPC(
-            x_size = hp.d_vout,
-            y_size = hp.d_prjh,
-            n_layers = hp.cpc_layers,
-            activation = hp.cpc_activation
-        )
-        self.cpc_za = CPC(
-            x_size = hp.d_aout,
-            y_size = hp.d_prjh,
-            n_layers = hp.cpc_layers,
-            activation = hp.cpc_activation
-        )
-
-        # Trimodal Settings
-        self.fusion_prj = SubNet(
-            in_size = dim_sum,
-            hidden_size = hp.d_prjh,
-            n_class = hp.n_class,
-            dropout = hp.dropout_prj
-        )
-            
-    def forward(self, sentences, visual, acoustic, v_len, a_len, bert_sent, bert_sent_type, bert_sent_mask, y=None, mem=None):
-        """
-        text, audio, and vision should have dimension [batch_size, seq_len, n_features]
-        For Bert input, the length of text is "seq_len + 2"
-        """
-        enc_word = self.text_enc(sentences, bert_sent, bert_sent_type, bert_sent_mask) # (batch_size, seq_len, emb_size)
-        text = enc_word[:,0,:] # (batch_size, emb_size)
-
-        acoustic = self.acoustic_enc(acoustic, a_len)
-        visual = self.visual_enc(visual, v_len)
-
-        if y is not None:
-            lld_tv, tv_pn, H_tv = self.mi_tv(x=text, y=visual, labels=y, mem=mem['tv'])
-            lld_ta, ta_pn, H_ta = self.mi_ta(x=text, y=acoustic, labels=y, mem=mem['ta'])
-            # for ablation use
-            if self.add_va:
-                lld_va, va_pn, H_va = self.mi_va(x=visual, y=acoustic, labels=y, mem=mem['va'])
+    def forward(self, inputs, lengths):
+        if self.batch_first:
+            batch_size, max_len = inputs.size()[:2]
         else:
-            lld_tv, tv_pn, H_tv = self.mi_tv(x=text, y=visual)
-            lld_ta, ta_pn, H_ta = self.mi_ta(x=text, y=acoustic)
-            if self.add_va:
-                lld_va, va_pn, H_va = self.mi_va(x=visual, y=acoustic)
+            max_len, batch_size = inputs.size()[:2]
+            
+        # apply attention layer
+        weights = torch.bmm(inputs,
+                            self.att_weights  # (1, hidden_size)
+                            .permute(1, 0)  # (hidden_size, 1)
+                            .unsqueeze(0)  # (1, hidden_size, 1)
+                            .repeat(batch_size, 1, 1) # (batch_size, hidden_size, 1)
+                            )
+    
+        attentions = torch.softmax(F.relu(weights.squeeze()), dim=-1)
 
+        # create mask based on the sentence lengths
+        mask = torch.ones(attentions.size(), requires_grad=True).cuda()
+        for i, l in enumerate(lengths):  # skip the first sentence
+            if l < max_len:
+                mask[i, l:] = 0
 
-        # Linear proj and pred
-        fusion, preds = self.fusion_prj(torch.cat([text, acoustic, visual], dim=1))
-
-        nce_t = self.cpc_zt(text, fusion)
-        nce_v = self.cpc_zv(visual, fusion)
-        nce_a = self.cpc_za(acoustic, fusion)
+        # apply mask and renormalize attention scores (weights)
+        masked = attentions * mask
+        _sums = masked.sum(-1).unsqueeze(-1)  # sums per row
         
-        nce = nce_t + nce_v + nce_a
+        attentions = masked.div(_sums)
 
-        pn_dic = {'tv':tv_pn, 'ta':ta_pn, 'va': va_pn if self.add_va else None}
-        lld = lld_tv + lld_ta + (lld_va if self.add_va else 0.0)
-        H = H_tv + H_ta + (H_va if self.add_va else 0.0)
+        # apply attention weights
+        weighted = torch.mul(inputs, attentions.unsqueeze(-1).expand_as(inputs))
 
-        return lld, nce, preds, pn_dic, H
+        # get the final fixed vector representations of the sentences
+        representations = weighted.sum(1).squeeze()
+
+        return representations, attentions
+
+
+class ATTLSTM(nn.Module):
+    def __init__(self, hidden_dim=128, lstm_layer=2, dropout=0.2):
+        super(ATTLSTM, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        self.lstm1 = nn.LSTM(input_size=self.embedding.embedding_dim,
+                            hidden_size=hidden_dim,
+                            num_layers=1, 
+                            bidirectional=True)
+        self.atten1 = Attention(hidden_dim*2, batch_first=True) # 2 is bidrectional
+        self.lstm2 = nn.LSTM(input_size=hidden_dim*2,
+                            hidden_size=hidden_dim,
+                            num_layers=1, 
+                            bidirectional=True)
+        self.atten2 = Attention(hidden_dim*2, batch_first=True)
+        self.fc1 = nn.Sequential(nn.Linear(hidden_dim*lstm_layer*2, hidden_dim*lstm_layer*2),
+                                 nn.BatchNorm1d(hidden_dim*lstm_layer*2),
+                                 nn.ReLU()) 
+        self.fc2 = nn.Linear(hidden_dim*lstm_layer*2, 1)
+
+    
+    def forward(self, x, x_len):
+        x = self.dropout(x)
+        
+        x = nn.utils.rnn.pack_padded_sequence(x, x_len, batch_first=True)
+        out1, (h_n, c_n) = self.lstm1(x)
+        x, lengths = nn.utils.rnn.pad_packed_sequence(out1, batch_first=True)
+        x, _ = self.atten1(x, lengths) # skip connect
+
+        out2, (h_n, c_n) = self.lstm2(out1)
+        y, lengths = nn.utils.rnn.pad_packed_sequence(out2, batch_first=True)
+        y, _ = self.atten2(y, lengths)
+        
+        z = torch.cat([x, y], dim=1)
+        z = self.fc1(self.dropout(z))
+        z = self.fc2(self.dropout(z))
+        return z
+
+
+
+class TripletAttentionModel(nn.Module):
+    def __init__(self):
+        super(TripletAttentionModel, self).__init__()
+        self.sa_block_1 = ATTLSTM()
+        self.sa_block_2 = ATTLSTM()
+        self.sa_block_3 = ATTLSTM()
+
+    def forward(self, x1, x2, x3):
+        len_x1 = x1.shape[1]
+        len_x2 = x2.shape[1]
+        len_x3 = x3.shape[1]
+        x1_stream_1 = self.sa_block_0(x1, len_x1)
+        x2_stream_2 = self.sa_block_1(x2, len_x2)
+        x3_stream_3 = self.sa_block_3(x3, len_x3)
+        out = x1_stream_1 + x2_stream_2 + x3_stream_3
+        return out
